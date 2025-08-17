@@ -39,6 +39,7 @@
 
 # debug information files
 *.dwo
-./kernel-intermediate/*
-./um-intermediate/*
+./build/kernel-intermediate/*
+./build/um-intermediate/*
 .vs
+./build
