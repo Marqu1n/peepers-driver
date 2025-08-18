@@ -42,4 +42,5 @@
 ./build/kernel-intermediate/*
 ./build/um-intermediate/*
 .vs
-./build
+./build/
+build/
