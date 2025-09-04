@@ -35,6 +35,10 @@ typedef struct _PROCESS_INFO {
 	ULONGLONG ReadTransferCount;
 	ULONGLONG WriteTransferCount;
 	ULONGLONG OtherTransferCount;
+
+	PVOID CurrentProcessAddress;
+	PVOID NextProcessAddress;
+	PVOID PreviousProcessAddress;
 } PROCESS_INFO, * PPROCESS_INFO;
 
 typedef struct _PROCESS_REQUEST {
@@ -102,6 +106,10 @@ void DisplayProcessInfo(const PROCESS_INFO& info) {
 	std::wcout << L"Read Transfer: " << info.ReadTransferCount << L" bytes" << std::endl;
 	std::wcout << L"Write Transfer: " << info.WriteTransferCount << L" bytes" << std::endl;
 	std::wcout << L"Other Transfer: " << info.OtherTransferCount << L" bytes" << std::endl;
+
+	std::wcout << L"Current Process Address: 0x" << std::hex << info.CurrentProcessAddress << std::dec << std::endl;
+	std::wcout << L"Previous Process Address: 0x" << std::hex << info.PreviousProcessAddress << std::dec << std::endl;
+	std::wcout << L"Next Process Address: 0x" << std::hex << info.NextProcessAddress << std::dec << std::endl;
 }
 
 int main() {
