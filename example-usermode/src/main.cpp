@@ -1,90 +1,221 @@
 #include <windows.h>
 #include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <chrono>
-#include <ctime>
 #include <iomanip>
+#include <string>
 
-namespace codes {
-	constexpr ULONG IOCTL_LIST_PROCESSES = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA);
+#define IOCTL_LIST_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_GET_PROCESS_COUNT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_GET_PROCESS_BY_INDEX CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_GET_PROCESS_BY_PID CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA)
+
+typedef struct _PROCESS_INFO {
+	ULONG ProcessId;
+	ULONG ParentProcessId;
+	WCHAR ProcessName[64];
+	ULONG ThreadCount;
+	ULONG HandleCount;
+	LONG BasePriority;
+	LARGE_INTEGER CreateTime;
+	LARGE_INTEGER UserTime;
+	LARGE_INTEGER KernelTime;
+
+	// Memory information
+	SIZE_T WorkingSetSize;
+	SIZE_T PeakWorkingSetSize;
+	SIZE_T VirtualSize;
+	SIZE_T PeakVirtualSize;
+	SIZE_T PagefileUsage;
+	SIZE_T PeakPagefileUsage;
+	SIZE_T PageFaultCount;  // Changed from PrivatePageCount
+
+	// I/O information
+	ULONGLONG ReadOperationCount;
+	ULONGLONG WriteOperationCount;
+	ULONGLONG OtherOperationCount;
+	ULONGLONG ReadTransferCount;
+	ULONGLONG WriteTransferCount;
+	ULONGLONG OtherTransferCount;
+} PROCESS_INFO, * PPROCESS_INFO;
+
+typedef struct _PROCESS_REQUEST {
+	ULONG RequestType; // 0 = by index, 1 = by PID
+	ULONG Index;       // Process index (for iteration)
+	ULONG ProcessId;   // Process ID (for specific lookup)
+} PROCESS_REQUEST, * PPROCESS_REQUEST;
+
+typedef struct _PROCESS_COUNT_RESPONSE {
+	ULONG ProcessCount;
+	LONG Status;
+} PROCESS_COUNT_RESPONSE, * PPROCESS_COUNT_RESPONSE;
+
+std::string FormatFileTime(LARGE_INTEGER time) {
+	FILETIME ft;
+	ft.dwLowDateTime = time.LowPart;
+	ft.dwHighDateTime = time.HighPart;
+
+	SYSTEMTIME st;
+	FileTimeToSystemTime(&ft, &st);
+
+	char buffer[64];
+	sprintf_s(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	return std::string(buffer);
 }
 
-struct ProcessInfo {
-	ULONG pid;
-	ULONG parentPid;
-	ULONG sessionId;
-	CHAR imageName[16];
-};
+std::string FormatBytes(SIZE_T bytes) {
+	const char* units[] = { "B", "KB", "MB", "GB" };
+	double size = (double)bytes;
+	int unit = 0;
+
+	while (size >= 1024 && unit < 3) {
+		size /= 1024;
+		unit++;
+	}
+
+	char buffer[32];
+	sprintf_s(buffer, "%.2f %s", size, units[unit]);
+	return std::string(buffer);
+}
+
+void DisplayProcessInfo(const PROCESS_INFO& info) {
+	std::wcout << L"\n=== Process Information ===" << std::endl;
+	std::wcout << L"Name: " << info.ProcessName << std::endl;
+	std::wcout << L"PID: " << info.ProcessId << std::endl;
+	std::wcout << L"Parent PID: " << info.ParentProcessId << std::endl;
+	std::wcout << L"Threads: " << info.ThreadCount << std::endl;
+	std::wcout << L"Handles: " << info.HandleCount << std::endl;
+	std::wcout << L"Base Priority: " << info.BasePriority << std::endl;
+	std::wcout << L"Create Time: " << FormatFileTime(info.CreateTime).c_str() << std::endl;
+
+	std::wcout << L"\n--- Memory Information ---" << std::endl;
+	std::wcout << L"Working Set: " << FormatBytes(info.WorkingSetSize).c_str() << std::endl;
+	std::wcout << L"Peak Working Set: " << FormatBytes(info.PeakWorkingSetSize).c_str() << std::endl;
+	std::wcout << L"Virtual Size: " << FormatBytes(info.VirtualSize).c_str() << std::endl;
+	std::wcout << L"Peak Virtual Size: " << FormatBytes(info.PeakVirtualSize).c_str() << std::endl;
+	std::wcout << L"Pagefile Usage: " << FormatBytes(info.PagefileUsage).c_str() << std::endl;
+	std::wcout << L"Page Faults: " << info.PageFaultCount << std::endl;
+
+	std::wcout << L"\n--- I/O Information ---" << std::endl;
+	std::wcout << L"Read Operations: " << info.ReadOperationCount << std::endl;
+	std::wcout << L"Write Operations: " << info.WriteOperationCount << std::endl;
+	std::wcout << L"Other Operations: " << info.OtherOperationCount << std::endl;
+	std::wcout << L"Read Transfer: " << info.ReadTransferCount << L" bytes" << std::endl;
+	std::wcout << L"Write Transfer: " << info.WriteTransferCount << L" bytes" << std::endl;
+	std::wcout << L"Other Transfer: " << info.OtherTransferCount << L" bytes" << std::endl;
+}
 
 int main() {
-	
-	HANDLE hDevice = CreateFileW(L"\\DosDevices\\ExampleDriver", GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+	HANDLE hDevice = CreateFileA("\\\\.\\ExampleDriver",
+		GENERIC_READ | GENERIC_WRITE,
+		0, NULL, OPEN_EXISTING, 0, NULL);
+
 	if (hDevice == INVALID_HANDLE_VALUE) {
-		std::cerr << "[-] Failed to open device handle. Error: " << GetLastError() << std::endl;
+		std::cout << "Failed to open device. Error: " << GetLastError() << std::endl;
 		return 1;
 	}
 
-	ProcessInfo buffer[64];  // enough for 64 processes
-	DWORD bytesReturned = 0;
+	std::cout << "Connected to kernel driver successfully!" << std::endl;
 
-	BOOL success = DeviceIoControl(
-		hDevice,
-		codes::IOCTL_LIST_PROCESSES,
-		nullptr,                    // no input buffer
-		0,                          // input buffer size
-		buffer,                     // output buffer
-		sizeof(buffer),             // output buffer size
-		&bytesReturned,
-		nullptr
-	);
+	// Get process count
+	PROCESS_COUNT_RESPONSE countResponse;
+	DWORD bytesReturned;
 
-    namespace fs = std::filesystem;
+	if (!DeviceIoControl(hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
+		&countResponse, sizeof(countResponse), &bytesReturned, NULL)) {
+		std::cout << "Failed to get process count" << std::endl;
+		CloseHandle(hDevice);
+		return 1;
+	}
 
-    if (success) {
-        // Caminho da pasta onde os logs ficarão
-        std::string pasta = "C:\\LogsProcessos\\";
-        fs::create_directories(pasta); // Cria a pasta se não existir
+	std::cout << "Total processes: " << countResponse.ProcessCount << std::endl;
 
-        // Pega a data/hora atual
-        auto agora = std::chrono::system_clock::now();
-        std::time_t t = std::chrono::system_clock::to_time_t(agora);
+	std::string command;
+	while (true) {
+		std::cout << "\nCommands:" << std::endl;
+		std::cout << "  list - List all processes to file" << std::endl;
+		std::cout << "  count - Get process count" << std::endl;
+		std::cout << "  index <n> - Get process by index (0-" << (countResponse.ProcessCount - 1) << ")" << std::endl;
+		std::cout << "  pid <pid> - Get process by PID" << std::endl;
+		std::cout << "  iterate - Iterate through all processes" << std::endl;
+		std::cout << "  quit - Exit" << std::endl;
+		std::cout << "\nEnter command: ";
 
-        std::tm tm{};
-        localtime_s(&tm, &t);
+		std::getline(std::cin, command);
 
-        // Monta o nome do arquivo com a data
-        std::ostringstream oss;
-        oss << pasta
-            << "processos_"
-            << std::put_time(&tm, "%Y-%m-%d_%H-%M-%S")
-            << ".txt";
+		if (command == "quit") {
+			break;
+		}
+		else if (command == "list") {
+			if (DeviceIoControl(hDevice, IOCTL_LIST_PROCESSES, NULL, 0, NULL, 0, &bytesReturned, NULL)) {
+				std::cout << "Process list written to \\SystemRoot\\KernelProcessList.txt" << std::endl;
+			}
+			else {
+				std::cout << "Failed to list processes" << std::endl;
+			}
+		}
+		else if (command == "count") {
+			if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
+				&countResponse, sizeof(countResponse), &bytesReturned, NULL)) {
+				std::cout << "Process count: " << countResponse.ProcessCount << std::endl;
+			}
+			else {
+				std::cout << "Failed to get process count" << std::endl;
+			}
+		}
+		else if (command.substr(0, 5) == "index") {
+			try {
+				ULONG index = std::stoul(command.substr(6));
+				PROCESS_REQUEST request = { 0, index, 0 };
+				PROCESS_INFO processInfo;
 
-        std::string nomeArquivo = oss.str();
+				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
+					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
+					DisplayProcessInfo(processInfo);
+				}
+				else {
+					std::cout << "Failed to get process by index or invalid index" << std::endl;
+				}
+			}
+			catch (...) {
+				std::cout << "Invalid index format" << std::endl;
+			}
+		}
+		else if (command.substr(0, 3) == "pid") {
+			try {
+				ULONG pid = std::stoul(command.substr(4));
+				PROCESS_REQUEST request = { 1, 0, pid };
+				PROCESS_INFO processInfo;
 
-        std::ofstream outFile(nomeArquivo, std::ios::out);
+				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_PID, &request, sizeof(request),
+					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
+					DisplayProcessInfo(processInfo);
+				}
+				else {
+					std::cout << "Failed to get process by PID or process not found" << std::endl;
+				}
+			}
+			catch (...) {
+				std::cout << "Invalid PID format" << std::endl;
+			}
+		}
+		else if (command == "iterate") {
+			std::cout << "Iterating through all processes..." << std::endl;
+			for (ULONG i = 0; i < countResponse.ProcessCount; i++) {
+				PROCESS_REQUEST request = { 0, i, 0 };
+				PROCESS_INFO processInfo;
 
-        if (!outFile.is_open()) {
-            std::cerr << "Não foi possível abrir o arquivo para escrita!\n";
-        }
-        else {
-            size_t count = bytesReturned / sizeof(ProcessInfo);
-            for (size_t i = 0; i < count; i++) {
-                outFile << "PID: " << buffer[i].pid
-                    << ", Parent PID: " << buffer[i].parentPid
-                    << ", Session: " << buffer[i].sessionId
-                    << ", Name: " << buffer[i].imageName << "\n";
-            }
-            outFile.close();
-            std::cout << "Resultado salvo em " << nomeArquivo << "\n";
-        }
-    }
-    else {
-        std::cerr << "DeviceIoControl failed. Error: " << GetLastError() << "\n";
-    }
-
+				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
+					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
+					std::wcout << L"[" << i << L"] " << processInfo.ProcessName
+						<< L" (PID: " << processInfo.ProcessId << L")" << std::endl;
+				}
+			}
+		}
+		else {
+			std::cout << "Unknown command" << std::endl;
+		}
+	}
 
 	CloseHandle(hDevice);
-
 	return 0;
 }
