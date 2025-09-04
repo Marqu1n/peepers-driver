@@ -89,6 +89,10 @@ typedef struct _PROCESS_INFO {
 	ULONGLONG ReadTransferCount;
 	ULONGLONG WriteTransferCount;
 	ULONGLONG OtherTransferCount;
+
+	PVOID CurrentProcessAddress;
+	PVOID NextProcessAddress;
+	PVOID PreviousProcessAddress;
 } PROCESS_INFO, * PPROCESS_INFO;
 
 // Request structures for usermode communication
@@ -191,10 +195,11 @@ NTSTATUS GetProcessByIndex(ULONG index, PPROCESS_INFO processInfo) {
 	}
 
 	PSYSTEM_PROCESSES processEntry = (PSYSTEM_PROCESSES)g_ProcessBuffer;
+	PSYSTEM_PROCESSES previousEntry = NULL;
 	ULONG currentIndex = 0;
 
-	// Navigate to the requested index
 	while (currentIndex < index && processEntry->NextEntryDelta) {
+		previousEntry = processEntry;
 		processEntry = (PSYSTEM_PROCESSES)((BYTE*)processEntry + processEntry->NextEntryDelta);
 		currentIndex++;
 	}
@@ -203,7 +208,6 @@ NTSTATUS GetProcessByIndex(ULONG index, PPROCESS_INFO processInfo) {
 		return STATUS_NOT_FOUND;
 	}
 
-	// Fill process information
 	RtlZeroMemory(processInfo, sizeof(PROCESS_INFO));
 
 	processInfo->ProcessId = (ULONG)processEntry->ProcessId;
@@ -215,7 +219,6 @@ NTSTATUS GetProcessByIndex(ULONG index, PPROCESS_INFO processInfo) {
 	processInfo->UserTime = processEntry->UserTime;
 	processInfo->KernelTime = processEntry->KernelTime;
 
-	// Copy process name
 	if (processEntry->ProcessName.Length > 0 && processEntry->ProcessName.Buffer) {
 		ULONG nameLength = min(processEntry->ProcessName.Length / sizeof(WCHAR), 63);
 		RtlCopyMemory(processInfo->ProcessName, processEntry->ProcessName.Buffer, nameLength * sizeof(WCHAR));
@@ -225,22 +228,30 @@ NTSTATUS GetProcessByIndex(ULONG index, PPROCESS_INFO processInfo) {
 		wcscpy_s(processInfo->ProcessName, 64, L"System Idle Process");
 	}
 
-	// Memory information (using only available VM_COUNTERS members)
 	processInfo->WorkingSetSize = processEntry->VmCounters.WorkingSetSize;
 	processInfo->PeakWorkingSetSize = processEntry->VmCounters.PeakWorkingSetSize;
 	processInfo->VirtualSize = processEntry->VmCounters.VirtualSize;
 	processInfo->PeakVirtualSize = processEntry->VmCounters.PeakVirtualSize;
 	processInfo->PagefileUsage = processEntry->VmCounters.PagefileUsage;
 	processInfo->PeakPagefileUsage = processEntry->VmCounters.PeakPagefileUsage;
-	processInfo->PageFaultCount = processEntry->VmCounters.PageFaultCount; // This exists in VM_COUNTERS
+	processInfo->PageFaultCount = processEntry->VmCounters.PageFaultCount;
 
-	// I/O information
 	processInfo->ReadOperationCount = processEntry->IoCounters.ReadOperationCount;
 	processInfo->WriteOperationCount = processEntry->IoCounters.WriteOperationCount;
 	processInfo->OtherOperationCount = processEntry->IoCounters.OtherOperationCount;
 	processInfo->ReadTransferCount = processEntry->IoCounters.ReadTransferCount;
 	processInfo->WriteTransferCount = processEntry->IoCounters.WriteTransferCount;
 	processInfo->OtherTransferCount = processEntry->IoCounters.OtherTransferCount;
+
+	processInfo->CurrentProcessAddress = processEntry;
+	processInfo->PreviousProcessAddress = previousEntry;
+
+	if (processEntry->NextEntryDelta != 0) {
+		processInfo->NextProcessAddress = (PVOID)((BYTE*)processEntry + processEntry->NextEntryDelta);
+	}
+	else {
+		processInfo->NextProcessAddress = NULL;
+	}
 
 	return STATUS_SUCCESS;
 }
