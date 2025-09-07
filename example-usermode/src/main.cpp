@@ -2,6 +2,7 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <fstream>
 
 #define IOCTL_LIST_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_GET_PROCESS_COUNT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA)
@@ -14,7 +15,7 @@ typedef struct _PROCESS_INFO {
 	WCHAR ProcessName[64];
 	ULONG ThreadCount;
 	ULONG HandleCount;
-	LONG BasePriority;
+	//KPRIORITY BasePriority;
 	LARGE_INTEGER CreateTime;
 	LARGE_INTEGER UserTime;
 	LARGE_INTEGER KernelTime;
@@ -26,7 +27,7 @@ typedef struct _PROCESS_INFO {
 	SIZE_T PeakVirtualSize;
 	SIZE_T PagefileUsage;
 	SIZE_T PeakPagefileUsage;
-	SIZE_T PageFaultCount;  // Changed from PrivatePageCount
+	SIZE_T PageFaultCount;
 
 	// I/O information
 	ULONGLONG ReadOperationCount;
@@ -88,7 +89,7 @@ void DisplayProcessInfo(const PROCESS_INFO& info) {
 	std::wcout << L"Parent PID: " << info.ParentProcessId << std::endl;
 	std::wcout << L"Threads: " << info.ThreadCount << std::endl;
 	std::wcout << L"Handles: " << info.HandleCount << std::endl;
-	std::wcout << L"Base Priority: " << info.BasePriority << std::endl;
+	//std::wcout << L"Base Priority: " << info.BasePriority << std::endl;
 	std::wcout << L"Create Time: " << FormatFileTime(info.CreateTime).c_str() << std::endl;
 
 	std::wcout << L"\n--- Memory Information ---" << std::endl;
@@ -215,9 +216,42 @@ int main() {
 				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
 					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
 					std::wcout << L"[" << i << L"] " << processInfo.ProcessName
-						<< L" (PID: " << processInfo.ProcessId << L")" << std::endl;
+						<< L" (PID: " << processInfo.ProcessId << L")" << L" Prev Address:" << processInfo.PreviousProcessAddress << L" Address:" << processInfo.CurrentProcessAddress << L" Next address:" << processInfo.NextProcessAddress  << std::endl;
 				}
 			}
+
+
+			char systemRoot[MAX_PATH];
+			GetEnvironmentVariableA("SystemRoot", systemRoot, MAX_PATH);
+			std::string logFile = std::string(systemRoot) + "\\process_list.txt";
+
+			// Cria um ofstream para escrever no arquivo
+			std::wofstream file(logFile, std::ios::out);
+			if (!file.is_open()) {
+				std::cerr << "Não foi possível abrir o arquivo para escrita: " << logFile << std::endl;
+				return 1;
+			}
+
+			file << L"Iterating through all processes..." << std::endl;
+
+			for (ULONG i = 0; i < countResponse.ProcessCount; i++) {
+				PROCESS_REQUEST request = { 0, i, 0 };
+				PROCESS_INFO processInfo;
+
+				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
+					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
+					file << L"[" << i << L"] " << processInfo.ProcessName
+						<< L" (PID: " << processInfo.ProcessId << L")"
+						<< L" Prev Address:" << processInfo.PreviousProcessAddress
+						<< L" Address:" << processInfo.CurrentProcessAddress
+						<< L" Next address:" << processInfo.NextProcessAddress
+						//<< L" Mode:" << processInfo.ListLinkageMode
+						<< std::endl;
+				}
+			}
+
+			file.close();
+			std::wcout << L"Process list saved to " << logFile.c_str() << std::endl;
 		}
 		else {
 			std::cout << "Unknown command" << std::endl;
