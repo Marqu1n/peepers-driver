@@ -2,7 +2,12 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
-
+#include <sstream>
+#include <locale>
+#include <codecvt>
+#include <thread>
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #define IOCTL_LIST_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_GET_PROCESS_COUNT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA)
@@ -52,6 +57,108 @@ typedef struct _PROCESS_COUNT_RESPONSE {
 	ULONG ProcessCount;
 	LONG Status;
 } PROCESS_COUNT_RESPONSE, * PPROCESS_COUNT_RESPONSE;
+
+// ... existing code ...
+
+using json = nlohmann::json;
+
+// Global variables
+HANDLE g_hDevice = INVALID_HANDLE_VALUE;
+std::string g_remoteApiUrl = "http://localhost:8080/api/process-data"; // Default URL
+
+// Helper function to convert wide string to UTF-8
+std::string WideStringToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+// Convert PROCESS_INFO to JSON
+json ProcessInfoToJson(const PROCESS_INFO& info) {
+    json j;
+
+    // Convert wide string process name to UTF-8
+    std::wstring processNameWide(info.ProcessName);
+    j["processName"] = WideStringToUtf8(processNameWide);
+
+    j["processId"] = info.ProcessId;
+    j["parentProcessId"] = info.ParentProcessId;
+    j["threadCount"] = info.ThreadCount;
+    j["handleCount"] = info.HandleCount;
+    j["basePriority"] = info.BasePriority;
+
+    // Time information
+    j["createTime"] = FormatFileTime(info.CreateTime);
+    j["userTime"] = info.UserTime.QuadPart;
+    j["kernelTime"] = info.KernelTime.QuadPart;
+
+    // Memory information
+    j["memory"] = {
+        {"workingSetSize", info.WorkingSetSize},
+        {"peakWorkingSetSize", info.PeakWorkingSetSize},
+        {"virtualSize", info.VirtualSize},
+        {"peakVirtualSize", info.PeakVirtualSize},
+        {"pagefileUsage", info.PagefileUsage},
+        {"peakPagefileUsage", info.PeakPagefileUsage},
+        {"pageFaultCount", info.PageFaultCount}
+    };
+
+    // I/O information
+    j["io"] = {
+        {"readOperationCount", info.ReadOperationCount},
+        {"writeOperationCount", info.WriteOperationCount},
+        {"otherOperationCount", info.OtherOperationCount},
+        {"readTransferCount", info.ReadTransferCount},
+        {"writeTransferCount", info.WriteTransferCount},
+        {"otherTransferCount", info.OtherTransferCount}
+    };
+
+    // Address information (as hex strings)
+    std::stringstream ss;
+    ss << "0x" << std::hex << (uintptr_t)info.CurrentProcessAddress;
+    j["currentProcessAddress"] = ss.str();
+
+    ss.str("");
+    ss << "0x" << std::hex << (uintptr_t)info.PreviousProcessAddress;
+    j["previousProcessAddress"] = ss.str();
+
+    ss.str("");
+    ss << "0x" << std::hex << (uintptr_t)info.NextProcessAddress;
+    j["nextProcessAddress"] = ss.str();
+
+    return j;
+}
+
+// Send data to remote API
+bool SendToRemoteApi(const json& data, const std::string& endpoint = "") {
+    try {
+        httplib::Client client(g_remoteApiUrl.c_str());
+        client.set_connection_timeout(5, 0); // 5 seconds
+        client.set_read_timeout(10, 0); // 10 seconds
+
+        std::string jsonStr = data.dump();
+        std::string url = endpoint.empty() ? "/" : endpoint;
+
+        auto res = client.Post(url.c_str(), jsonStr, "application/json");
+
+        if (res && res->status == 200) {
+            std::cout << "Data sent successfully to remote API" << std::endl;
+            return true;
+        } else {
+            std::cout << "Failed to send data to remote API. Status: "
+                      << (res ? res->status : -1) << std::endl;
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cout << "Exception sending data to remote API: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// ... existing code ...
 
 std::string FormatFileTime(LARGE_INTEGER time) {
 	FILETIME ft;
@@ -108,123 +215,151 @@ void DisplayProcessInfo(const PROCESS_INFO& info) {
 	std::wcout << L"Write Transfer: " << info.WriteTransferCount << L" bytes" << std::endl;
 	std::wcout << L"Other Transfer: " << info.OtherTransferCount << L" bytes" << std::endl;
 
-	std::wcout << L"Current Process Address: 0x" << std::hex << info.CurrentProcessAddress << std::dec << std::endl;
-	std::wcout << L"Previous Process Address: 0x" << std::hex << info.PreviousProcessAddress << std::dec << std::endl;
-	std::wcout << L"Next Process Address: 0x" << std::hex << info.NextProcessAddress << std::dec << std::endl;
-}
-
 int main() {
-	HANDLE hDevice = CreateFileA("\\\\.\\ExampleDriver",
-		GENERIC_READ | GENERIC_WRITE,
-		0, NULL, OPEN_EXISTING, 0, NULL);
+    std::cout << "=== Process Monitor Webhook Server ===" << std::endl;
 
-	if (hDevice == INVALID_HANDLE_VALUE) {
-		std::cout << "Failed to open device. Error: " << GetLastError() << std::endl;
-		return 1;
-	}
+    // Open connection to kernel driver
+    g_hDevice = CreateFileA("\\\\.\\ExampleDriver",
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING, 0, NULL);
 
-	std::cout << "Connected to kernel driver successfully!" << std::endl;
+    if (g_hDevice == INVALID_HANDLE_VALUE) {
+        std::cout << "Failed to open device. Error: " << GetLastError() << std::endl;
+        std::cout << "Make sure the kernel driver is loaded." << std::endl;
+        return 1;
+    }
 
-	// Get process count
-	PROCESS_COUNT_RESPONSE countResponse;
-	DWORD bytesReturned;
+    std::cout << "Connected to kernel driver successfully!" << std::endl;
 
-	if (!DeviceIoControl(hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
-		&countResponse, sizeof(countResponse), &bytesReturned, NULL)) {
-		std::cout << "Failed to get process count" << std::endl;
-		CloseHandle(hDevice);
-		return 1;
-	}
+    // Test connection by getting process count
+    PROCESS_COUNT_RESPONSE countResponse;
+    DWORD bytesReturned;
 
-	std::cout << "Total processes: " << countResponse.ProcessCount << std::endl;
+    if (!DeviceIoControl(g_hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
+        &countResponse, sizeof(countResponse), &bytesReturned, NULL)) {
+        std::cout << "Failed to get process count from driver" << std::endl;
+        CloseHandle(g_hDevice);
+        return 1;
+    }
 
-	std::string command;
-	while (true) {
-		std::cout << "\nCommands:" << std::endl;
-		std::cout << "  list - List all processes to file" << std::endl;
-		std::cout << "  count - Get process count" << std::endl;
-		std::cout << "  index <n> - Get process by index (0-" << (countResponse.ProcessCount - 1) << ")" << std::endl;
-		std::cout << "  pid <pid> - Get process by PID" << std::endl;
-		std::cout << "  iterate - Iterate through all processes" << std::endl;
-		std::cout << "  quit - Exit" << std::endl;
-		std::cout << "\nEnter command: ";
+    std::cout << "Driver connection verified. Total processes: " << countResponse.ProcessCount << std::endl;
 
-		std::getline(std::cin, command);
+    // Create HTTP server
+    httplib::Server server;
 
-		if (command == "quit") {
-			break;
-		}
-		else if (command == "list") {
-			if (DeviceIoControl(hDevice, IOCTL_LIST_PROCESSES, NULL, 0, NULL, 0, &bytesReturned, NULL)) {
-				std::cout << "Process list written to \\SystemRoot\\KernelProcessList.txt" << std::endl;
-			}
-			else {
-				std::cout << "Failed to list processes" << std::endl;
-			}
-		}
-		else if (command == "count") {
-			if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
-				&countResponse, sizeof(countResponse), &bytesReturned, NULL)) {
-				std::cout << "Process count: " << countResponse.ProcessCount << std::endl;
-			}
-			else {
-				std::cout << "Failed to get process count" << std::endl;
-			}
-		}
-		else if (command.substr(0, 5) == "index") {
-			try {
-				ULONG index = std::stoul(command.substr(6));
-				PROCESS_REQUEST request = { 0, index, 0 };
-				PROCESS_INFO processInfo;
+    // Enable CORS for all origins (adjust as needed for security)
+    server.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
-				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
-					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
-					DisplayProcessInfo(processInfo);
-				}
-				else {
-					std::cout << "Failed to get process by index or invalid index" << std::endl;
-				}
-			}
-			catch (...) {
-				std::cout << "Invalid index format" << std::endl;
-			}
-		}
-		else if (command.substr(0, 3) == "pid") {
-			try {
-				ULONG pid = std::stoul(command.substr(4));
-				PROCESS_REQUEST request = { 1, 0, pid };
-				PROCESS_INFO processInfo;
+    // Handle OPTIONS requests for CORS preflight
+    server.Options(".*", [](const httplib::Request&, httplib::Response& res) {
+        return;
+    });
 
-				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_PID, &request, sizeof(request),
-					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
-					DisplayProcessInfo(processInfo);
-				}
-				else {
-					std::cout << "Failed to get process by PID or process not found" << std::endl;
-				}
-			}
-			catch (...) {
-				std::cout << "Invalid PID format" << std::endl;
-			}
-		}
-		else if (command == "iterate") {
-			std::cout << "Iterating through all processes..." << std::endl;
-			for (ULONG i = 0; i < countResponse.ProcessCount; i++) {
-				PROCESS_REQUEST request = { 0, i, 0 };
-				PROCESS_INFO processInfo;
+    // Register webhook endpoints
+    server.Post("/webhook/list-processes", HandleListProcesses);
+    server.Post("/webhook/process-count", HandleGetProcessCount);
+    server.Post("/webhook/process-by-index", HandleGetProcessByIndex);
+    server.Post("/webhook/process-by-pid", HandleGetProcessByPid);
+    server.Post("/webhook/iterate-processes", HandleIterateProcesses);
+    server.Post("/webhook/set-api-url", HandleSetApiUrl);
 
-				if (DeviceIoControl(hDevice, IOCTL_GET_PROCESS_BY_INDEX, &request, sizeof(request),
-					&processInfo, sizeof(processInfo), &bytesReturned, NULL)) {
-					std::wcout << L"[" << i << L"] " << processInfo.ProcessName
-						<< L" (PID: " << processInfo.ProcessId << L")" << std::endl;
-				}
-			}
-		}
-		else {
-			std::cout << "Unknown command" << std::endl;
-		}
-	}
+    // Health check endpoint
+    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        json response;
+        response["status"] = "healthy";
+        response["service"] = "Process Monitor Webhook";
+        response["driverConnected"] = (g_hDevice != INVALID_HANDLE_VALUE);
+        response["remoteApiUrl"] = g_remoteApiUrl;
+        res.set_content(response.dump(), "application/json");
+    });
 
-	CloseHandle(hDevice);
-	return 0;
+    // Status endpoint with detailed information
+    server.Get("/status", [&countResponse](const httplib::Request&, httplib::Response& res) {
+        json response;
+        response["service"] = "Process Monitor Webhook Server";
+        response["driverConnected"] = (g_hDevice != INVALID_HANDLE_VALUE);
+        response["remoteApiUrl"] = g_remoteApiUrl;
+
+        if (g_hDevice != INVALID_HANDLE_VALUE) {
+            DWORD bytesReturned;
+            PROCESS_COUNT_RESPONSE currentCount;
+            if (DeviceIoControl(g_hDevice, IOCTL_GET_PROCESS_COUNT, NULL, 0,
+                &currentCount, sizeof(currentCount), &bytesReturned, NULL)) {
+                response["currentProcessCount"] = currentCount.ProcessCount;
+            }
+        }
+
+        response["availableEndpoints"] = {
+            "POST /webhook/list-processes",
+            "POST /webhook/process-count",
+            "POST /webhook/process-by-index",
+            "POST /webhook/process-by-pid",
+            "POST /webhook/iterate-processes",
+            "POST /webhook/set-api-url",
+            "GET /health",
+            "GET /status"
+        };
+
+        res.set_content(response.dump(2), "application/json");
+    });
+
+    // Set server configuration
+    const char* host = "0.0.0.0";
+    int port = 8888;
+
+    std::cout << "\n=== Webhook Server Configuration ===" << std::endl;
+    std::cout << "Host: " << host << std::endl;
+    std::cout << "Port: " << port << std::endl;
+    std::cout << "Remote API URL: " << g_remoteApiUrl << std::endl;
+    std::cout << "\n=== Available Endpoints ===" << std::endl;
+    std::cout << "POST /webhook/list-processes - List all processes to file" << std::endl;
+    std::cout << "POST /webhook/process-count - Get total process count" << std::endl;
+    std::cout << "POST /webhook/process-by-index - Get process by index (JSON: {\"index\": N})" << std::endl;
+    std::cout << "POST /webhook/process-by-pid - Get process by PID (JSON: {\"pid\": N})" << std::endl;
+    std::cout << "POST /webhook/iterate-processes - Get all processes summary" << std::endl;
+    std::cout << "POST /webhook/set-api-url - Set remote API URL (JSON: {\"apiUrl\": \"url\"})" << std::endl;
+    std::cout << "GET /health - Health check" << std::endl;
+    std::cout << "GET /status - Detailed status information" << std::endl;
+
+    std::cout << "\nStarting webhook server..." << std::endl;
+
+    // Start server in a separate thread so we can handle shutdown gracefully
+    std::thread serverThread([&server, host, port]() {
+        if (!server.listen(host, port)) {
+            std::cout << "Failed to start server on " << host << ":" << port << std::endl;
+        }
+    });
+
+    std::cout << "Webhook server started successfully!" << std::endl;
+    std::cout << "Server is listening on http://" << host << ":" << port << std::endl;
+    std::cout << "\nPress 'q' and Enter to quit..." << std::endl;
+
+    // Wait for user input to quit
+    std::string input;
+    while (std::getline(std::cin, input)) {
+        if (input == "q" || input == "quit") {
+            break;
+        }
+        std::cout << "Press 'q' and Enter to quit..." << std::endl;
+    }
+
+    std::cout << "Shutting down server..." << std::endl;
+    server.stop();
+
+    if (serverThread.joinable()) {
+        serverThread.join();
+    }
+
+    // Clean up
+    if (g_hDevice != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hDevice);
+    }
+
+    std::cout << "Server stopped. Goodbye!" << std::endl;
+    return 0;
 }
