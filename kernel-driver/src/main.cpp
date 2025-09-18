@@ -29,38 +29,6 @@ NTSTATUS DispatchCreateClose(PDEVICE_OBJECT deviceObject, PIRP Irp) {
 	return STATUS_SUCCESS;
 }
 
-typedef struct _SYSTEM_THREADS {
-	LARGE_INTEGER  KernelTime;
-	LARGE_INTEGER  UserTime;
-	LARGE_INTEGER  CreateTime;
-	ULONG          WaitTime;
-	PVOID          StartAddress;
-	CLIENT_ID      ClientId;
-	KPRIORITY      Priority;
-	KPRIORITY      BasePriority;
-	ULONG          ContextSwitchCount;
-	LONG           State;
-	LONG           WaitReason;
-} SYSTEM_THREADS, * PSYSTEM_THREADS;
-
-typedef struct _SYSTEM_PROCESSES {
-	ULONG            NextEntryDelta;
-	ULONG            ThreadCount;
-	ULONG            Reserved1[6];
-	LARGE_INTEGER    CreateTime;
-	LARGE_INTEGER    UserTime;
-	LARGE_INTEGER    KernelTime;
-	UNICODE_STRING   ProcessName;
-	KPRIORITY        BasePriority;
-	SIZE_T           ProcessId;
-	SIZE_T           InheritedFromProcessId;
-	ULONG            HandleCount;
-	ULONG            Reserved2[2];
-	VM_COUNTERS      VmCounters;
-	IO_COUNTERS      IoCounters;
-	SYSTEM_THREADS   Threads[1];
-} SYSTEM_PROCESSES, * PSYSTEM_PROCESSES;
-
 // Enhanced process information structure for usermode communication
 typedef struct _PROCESS_INFO {
 	ULONG ProcessId;
@@ -68,19 +36,19 @@ typedef struct _PROCESS_INFO {
 	WCHAR ProcessName[64];
 	ULONG ThreadCount;
 	ULONG HandleCount;
-	KPRIORITY BasePriority;
+	LONG BasePriority;
 	LARGE_INTEGER CreateTime;
 	LARGE_INTEGER UserTime;
 	LARGE_INTEGER KernelTime;
 
-	// Memory information (using only available VM_COUNTERS members)
+	// Memory information
 	SIZE_T WorkingSetSize;
 	SIZE_T PeakWorkingSetSize;
 	SIZE_T VirtualSize;
 	SIZE_T PeakVirtualSize;
 	SIZE_T PagefileUsage;
 	SIZE_T PeakPagefileUsage;
-	SIZE_T PageFaultCount;  // Changed from PrivatePageCount
+	SIZE_T PageFaultCount;
 
 	// I/O information
 	ULONGLONG ReadOperationCount;
@@ -107,220 +75,321 @@ typedef struct _PROCESS_COUNT_RESPONSE {
 	NTSTATUS Status;
 } PROCESS_COUNT_RESPONSE, * PPROCESS_COUNT_RESPONSE;
 
-#define SystemProcessInformation 5
 #define POOL_TAG 'enoN'
 
-extern "C"
-NTSTATUS NTAPI ZwQuerySystemInformation(ULONG SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
+// Undocumented functions and structures
+extern "C" NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
+extern "C" NTKERNELAPI HANDLE PsGetProcessInheritedFromUniqueProcessId(PEPROCESS Process);
+extern "C" NTKERNELAPI PUCHAR PsGetProcessImageFileName(PEPROCESS Process);
+extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+extern "C" NTKERNELAPI ULONG PsGetProcessSessionId(PEPROCESS Process);
+
+// Offsets para EPROCESS (Windows 10/11 x64)
+// Estes offsets podem variar entre versões do Windows
+#define EPROCESS_ACTIVEPROCESSLINKS_OFFSET 0x1d8  // ActiveProcessLinks
+#define EPROCESS_THREADLISTHEAD_OFFSET 0x370      // ThreadListHead
+//#define EPROCESS_HANDLECOUNT_OFFSET 0x578         // HandleCount
+#define EPROCESS_CREATETIME_OFFSET 0x1f8          // CreateTime
+#define EPROCESS_EXITTIME_OFFSET 0x5c0            // ExitTime
+#define EPROCESS_RUNDOWNPROTECT_OFFSET 0x1e8      // RundownProtect
+#define EPROCESS_VMS_OFFSET 0x400                 // Vm (Virtual Memory Stats)
+
+// Estrutura para estatísticas de memória virtual
+typedef struct _MMSUPPORT_FLAGS {
+	UCHAR WorkingSetType : 3;
+	UCHAR Reserved0 : 3;
+	UCHAR MaximumWorkingSetHard : 1;
+	UCHAR MinimumWorkingSetHard : 1;
+	UCHAR SessionMaster : 1;
+	UCHAR TrimmerState : 2;
+	UCHAR Reserved : 1;
+	UCHAR PageStealers : 4;
+} MMSUPPORT_FLAGS;
+
+typedef struct _MMSUPPORT {
+	LIST_ENTRY WorkingSetExpansionLinks;
+	USHORT LastTrimStamp;
+	USHORT NextPageColor;
+	MMSUPPORT_FLAGS Flags;
+	ULONG PageFaultCount;
+	ULONG PeakWorkingSetSize;
+	ULONG WorkingSetSize;
+	ULONG MinimumWorkingSetSize;
+	ULONG MaximumWorkingSetSize;
+	// ... outros campos
+} MMSUPPORT, * PMMSUPPORT;
 
 // Global variables to cache process information
-static PVOID g_ProcessBuffer = NULL;
-static ULONG g_ProcessBufferSize = 0;
 static ULONG g_ProcessCount = 0;
 static LARGE_INTEGER g_LastUpdateTime = { 0 };
 
-NTSTATUS UpdateProcessCache() {
-	NTSTATUS status;
-	ULONG bufferSize = 0;
-	PVOID newBuffer = NULL;
-
-	// Get required buffer size
-	status = ZwQuerySystemInformation(SystemProcessInformation, NULL, 0, &bufferSize);
-	if (status != STATUS_INFO_LENGTH_MISMATCH) {
-		return status;
+// Helper function to get next process using ActiveProcessLinks
+PEPROCESS GetNextProcessManual(PEPROCESS currentProcess) {
+	if (!currentProcess) {
+		return NULL;
 	}
 
-	// Allocate buffer with some extra space
-	bufferSize += 0x1000;
-	newBuffer = ExAllocatePoolWithTag(PagedPool, bufferSize, POOL_TAG);
-	if (!newBuffer) {
-		return STATUS_INSUFFICIENT_RESOURCES;
+	// Get ActiveProcessLinks from current process
+	PLIST_ENTRY activeProcessLinks = (PLIST_ENTRY)((PUCHAR)currentProcess + EPROCESS_ACTIVEPROCESSLINKS_OFFSET);
+
+	// Get next entry in the list
+	PLIST_ENTRY nextEntry = activeProcessLinks->Flink;
+
+	if (!nextEntry) {
+		return NULL;
 	}
 
-	// Query process information
-	status = ZwQuerySystemInformation(SystemProcessInformation, newBuffer, bufferSize, &bufferSize);
-	if (!NT_SUCCESS(status)) {
-		ExFreePoolWithTag(newBuffer, POOL_TAG);
-		return status;
+	// Calculate EPROCESS address from ActiveProcessLinks offset
+	PEPROCESS nextProcess = (PEPROCESS)((PUCHAR)nextEntry - EPROCESS_ACTIVEPROCESSLINKS_OFFSET);
+
+	return nextProcess;
+}
+
+NTSTATUS GetProcessCountEPROCESS(PULONG processCount) {
+	ULONG count = 0;
+	PEPROCESS currentProcess = NULL;
+	PEPROCESS initialProcess = NULL;
+
+	// Obter o processo inicial (normalmente System process)
+	currentProcess = PsGetCurrentProcess();
+	initialProcess = currentProcess;
+
+	if (!currentProcess) {
+		return STATUS_UNSUCCESSFUL;
 	}
 
-	// Free old buffer and update cache
-	if (g_ProcessBuffer) {
-		ExFreePoolWithTag(g_ProcessBuffer, POOL_TAG);
-	}
-
-	g_ProcessBuffer = newBuffer;
-	g_ProcessBufferSize = bufferSize;
-
-	// Count processes
-	PSYSTEM_PROCESSES processEntry = (PSYSTEM_PROCESSES)g_ProcessBuffer;
-	g_ProcessCount = 0;
-
+	// Percorrer a lista circular de processos
 	do {
-		g_ProcessCount++;
-		if (processEntry->NextEntryDelta == 0) break;
-		processEntry = (PSYSTEM_PROCESSES)((BYTE*)processEntry + processEntry->NextEntryDelta);
-	} while (TRUE);
+		count++;
+		currentProcess = GetNextProcessManual(currentProcess);
 
+		if (!currentProcess) {
+			break;
+		}
+
+		// Verificar se voltamos ao processo inicial (lista circular)
+		if (currentProcess == initialProcess && count > 1) {
+			break;
+		}
+
+		// Proteção contra loop infinito
+		if (count > 10000) {
+			break;
+		}
+
+	} while (currentProcess && currentProcess != initialProcess);
+
+	*processCount = count;
+	g_ProcessCount = count;
 	KeQuerySystemTime(&g_LastUpdateTime);
+
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS GetProcessCount(PULONG processCount) {
-	LARGE_INTEGER currentTime;
-	KeQuerySystemTime(&currentTime);
-
-	// Update cache if it's older than 5 seconds or empty
-	if (!g_ProcessBuffer || (currentTime.QuadPart - g_LastUpdateTime.QuadPart) > 50000000LL) {
-		NTSTATUS status = UpdateProcessCache();
-		if (!NT_SUCCESS(status)) {
-			return status;
-		}
-	}
-
-	*processCount = g_ProcessCount;
-	return STATUS_SUCCESS;
-}
-
-NTSTATUS GetProcessByIndex(ULONG index, PPROCESS_INFO processInfo) {
-	if (!g_ProcessBuffer) {
-		NTSTATUS status = UpdateProcessCache();
-		if (!NT_SUCCESS(status)) {
-			return status;
-		}
-	}
-
-	if (index >= g_ProcessCount) {
-		return STATUS_INVALID_PARAMETER;
-	}
-
-	PSYSTEM_PROCESSES processEntry = (PSYSTEM_PROCESSES)g_ProcessBuffer;
-	PSYSTEM_PROCESSES previousEntry = NULL;
+NTSTATUS GetProcessByIndexEPROCESS(ULONG index, PPROCESS_INFO processInfo) {
 	ULONG currentIndex = 0;
+	PEPROCESS currentProcess = NULL;
+	PEPROCESS initialProcess = NULL;
+	PEPROCESS previousProcess = NULL;
 
-	while (currentIndex < index && processEntry->NextEntryDelta) {
-		previousEntry = processEntry;
-		processEntry = (PSYSTEM_PROCESSES)((BYTE*)processEntry + processEntry->NextEntryDelta);
+	// Obter o processo inicial
+	currentProcess = PsGetCurrentProcess();
+	initialProcess = currentProcess;
+
+	if (!currentProcess) {
+		return STATUS_UNSUCCESSFUL;
+	}
+
+	// Percorrer até o índice desejado
+	while (currentIndex < index) {
+		previousProcess = currentProcess;
+		currentProcess = GetNextProcessManual(currentProcess);
+
+		if (!currentProcess) {
+			return STATUS_NOT_FOUND;
+		}
+
 		currentIndex++;
+
+		// Verificar se voltamos ao início (não deveria acontecer antes do índice)
+		if (currentProcess == initialProcess && currentIndex > 0) {
+			return STATUS_NOT_FOUND;
+		}
+
+		// Proteção contra loop infinito
+		if (currentIndex > 10000) {
+			return STATUS_NOT_FOUND;
+		}
 	}
 
 	if (currentIndex != index) {
 		return STATUS_NOT_FOUND;
 	}
 
+	// Preencher informações do processo
 	RtlZeroMemory(processInfo, sizeof(PROCESS_INFO));
 
-	processInfo->ProcessId = (ULONG)processEntry->ProcessId;
-	processInfo->ParentProcessId = (ULONG)processEntry->InheritedFromProcessId;
-	processInfo->ThreadCount = processEntry->ThreadCount;
-	processInfo->HandleCount = processEntry->HandleCount;
-	processInfo->BasePriority = processEntry->BasePriority;
-	processInfo->CreateTime = processEntry->CreateTime;
-	processInfo->UserTime = processEntry->UserTime;
-	processInfo->KernelTime = processEntry->KernelTime;
+	// Informações básicas
+	processInfo->ProcessId = HandleToULong(PsGetProcessId(currentProcess));
+	processInfo->ParentProcessId = HandleToULong(PsGetProcessInheritedFromUniqueProcessId(currentProcess));
 
-	if (processEntry->ProcessName.Length > 0 && processEntry->ProcessName.Buffer) {
-		ULONG nameLength = min(processEntry->ProcessName.Length / sizeof(WCHAR), 63);
-		RtlCopyMemory(processInfo->ProcessName, processEntry->ProcessName.Buffer, nameLength * sizeof(WCHAR));
-		processInfo->ProcessName[nameLength] = L'\0';
+	// Nome do processo
+	PUCHAR imageFileName = PsGetProcessImageFileName(currentProcess);
+	if (imageFileName) {
+		// Converter de ANSI para Unicode
+		ANSI_STRING ansiString;
+		UNICODE_STRING unicodeString;
+		RtlInitAnsiString(&ansiString, (PCSZ)imageFileName);
+
+		unicodeString.Buffer = processInfo->ProcessName;
+		unicodeString.MaximumLength = sizeof(processInfo->ProcessName);
+		unicodeString.Length = 0;
+
+		RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
 	}
-	else {
-		wcscpy_s(processInfo->ProcessName, 64, L"System Idle Process");
+
+	// Acessar campos usando offsets (método não documentado)
+	__try {
+		// CreateTime
+		PLARGE_INTEGER createTime = (PLARGE_INTEGER)((PUCHAR)currentProcess + EPROCESS_CREATETIME_OFFSET);
+		processInfo->CreateTime = *createTime;
+
+		// HandleCount
+		//PULONG handleCount = (PULONG)((PUCHAR)currentProcess + EPROCESS_HANDLECOUNT_OFFSET);
+		//processInfo->HandleCount = *handleCount;
+
+		// Contar threads manualmente percorrendo ThreadListHead
+		PLIST_ENTRY threadListHead = (PLIST_ENTRY)((PUCHAR)currentProcess + EPROCESS_THREADLISTHEAD_OFFSET);
+		PLIST_ENTRY currentEntry = threadListHead->Flink;
+		ULONG threadCount = 0;
+
+		while (currentEntry != threadListHead && threadCount < 1000) {
+			threadCount++;
+			currentEntry = currentEntry->Flink;
+		}
+		processInfo->ThreadCount = threadCount;
+
+		// Informações de memória virtual (usando offset para MMSUPPORT)
+		PMMSUPPORT vmSupport = (PMMSUPPORT)((PUCHAR)currentProcess + EPROCESS_VMS_OFFSET);
+		processInfo->WorkingSetSize = vmSupport->WorkingSetSize * PAGE_SIZE;
+		processInfo->PeakWorkingSetSize = vmSupport->PeakWorkingSetSize * PAGE_SIZE;
+		processInfo->PageFaultCount = vmSupport->PageFaultCount;
+
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		// Em caso de erro ao acessar memória, definir valores padrão
+		processInfo->CreateTime.QuadPart = 0;
+		processInfo->HandleCount = 0;
+		processInfo->ThreadCount = 0;
+		processInfo->WorkingSetSize = 0;
+		processInfo->PeakWorkingSetSize = 0;
+		processInfo->PageFaultCount = 0;
 	}
 
-	processInfo->WorkingSetSize = processEntry->VmCounters.WorkingSetSize;
-	processInfo->PeakWorkingSetSize = processEntry->VmCounters.PeakWorkingSetSize;
-	processInfo->VirtualSize = processEntry->VmCounters.VirtualSize;
-	processInfo->PeakVirtualSize = processEntry->VmCounters.PeakVirtualSize;
-	processInfo->PagefileUsage = processEntry->VmCounters.PagefileUsage;
-	processInfo->PeakPagefileUsage = processEntry->VmCounters.PeakPagefileUsage;
-	processInfo->PageFaultCount = processEntry->VmCounters.PageFaultCount;
+	// Endereços dos processos
+	processInfo->CurrentProcessAddress = currentProcess;
+	processInfo->PreviousProcessAddress = previousProcess;
 
-	processInfo->ReadOperationCount = processEntry->IoCounters.ReadOperationCount;
-	processInfo->WriteOperationCount = processEntry->IoCounters.WriteOperationCount;
-	processInfo->OtherOperationCount = processEntry->IoCounters.OtherOperationCount;
-	processInfo->ReadTransferCount = processEntry->IoCounters.ReadTransferCount;
-	processInfo->WriteTransferCount = processEntry->IoCounters.WriteTransferCount;
-	processInfo->OtherTransferCount = processEntry->IoCounters.OtherTransferCount;
-
-	processInfo->CurrentProcessAddress = processEntry;
-	processInfo->PreviousProcessAddress = previousEntry;
-
-	if (processEntry->NextEntryDelta != 0) {
-		processInfo->NextProcessAddress = (PVOID)((BYTE*)processEntry + processEntry->NextEntryDelta);
-	}
-	else {
-		processInfo->NextProcessAddress = NULL;
-	}
+	PEPROCESS nextProcess = GetNextProcessManual(currentProcess);
+	processInfo->NextProcessAddress = (nextProcess != initialProcess) ? nextProcess : NULL;
 
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS GetProcessByPid(ULONG processId, PPROCESS_INFO processInfo) {
-	if (!g_ProcessBuffer) {
-		NTSTATUS status = UpdateProcessCache();
-		if (!NT_SUCCESS(status)) {
-			return status;
-		}
+NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
+	PEPROCESS currentProcess = NULL;
+	PEPROCESS initialProcess = NULL;
+	ULONG iterations = 0;
+
+	// Obter o processo inicial
+	currentProcess = PsGetCurrentProcess();
+	initialProcess = currentProcess;
+
+	if (!currentProcess) {
+		return STATUS_UNSUCCESSFUL;
 	}
 
-	PSYSTEM_PROCESSES processEntry = (PSYSTEM_PROCESSES)g_ProcessBuffer;
-
+	// Percorrer a lista procurando pelo PID
 	do {
-		if (processEntry->ProcessId == processId) {
-			// Found the process, fill information
+		HANDLE currentPid = PsGetProcessId(currentProcess);
+
+		if (HandleToULong(currentPid) == processId) {
+			// Processo encontrado, preencher informações
 			RtlZeroMemory(processInfo, sizeof(PROCESS_INFO));
 
-			processInfo->ProcessId = (ULONG)processEntry->ProcessId;
-			processInfo->ParentProcessId = (ULONG)processEntry->InheritedFromProcessId;
-			processInfo->ThreadCount = processEntry->ThreadCount;
-			processInfo->HandleCount = processEntry->HandleCount;
-			processInfo->BasePriority = processEntry->BasePriority;
-			processInfo->CreateTime = processEntry->CreateTime;
-			processInfo->UserTime = processEntry->UserTime;
-			processInfo->KernelTime = processEntry->KernelTime;
+			processInfo->ProcessId = processId;
+			processInfo->ParentProcessId = HandleToULong(PsGetProcessInheritedFromUniqueProcessId(currentProcess));
 
-			// Copy process name
-			if (processEntry->ProcessName.Length > 0 && processEntry->ProcessName.Buffer) {
-				ULONG nameLength = min(processEntry->ProcessName.Length / sizeof(WCHAR), 63);
-				RtlCopyMemory(processInfo->ProcessName, processEntry->ProcessName.Buffer, nameLength * sizeof(WCHAR));
-				processInfo->ProcessName[nameLength] = L'\0';
-			}
-			else {
-				wcscpy_s(processInfo->ProcessName, 64, L"System Idle Process");
+			// Nome do processo
+			PUCHAR imageFileName = PsGetProcessImageFileName(currentProcess);
+			if (imageFileName) {
+				ANSI_STRING ansiString;
+				UNICODE_STRING unicodeString;
+				RtlInitAnsiString(&ansiString, (PCSZ)imageFileName);
+
+				unicodeString.Buffer = processInfo->ProcessName;
+				unicodeString.MaximumLength = sizeof(processInfo->ProcessName);
+				unicodeString.Length = 0;
+
+				RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
 			}
 
-			// Memory information
-			processInfo->WorkingSetSize = processEntry->VmCounters.WorkingSetSize;
-			processInfo->PeakWorkingSetSize = processEntry->VmCounters.PeakWorkingSetSize;
-			processInfo->VirtualSize = processEntry->VmCounters.VirtualSize;
-			processInfo->PeakVirtualSize = processEntry->VmCounters.PeakVirtualSize;
-			processInfo->PagefileUsage = processEntry->VmCounters.PagefileUsage;
-			processInfo->PeakPagefileUsage = processEntry->VmCounters.PeakPagefileUsage;
-			processInfo->PageFaultCount = processEntry->VmCounters.PageFaultCount;
+			// Acessar campos usando offsets
+			__try {
+				PLARGE_INTEGER createTime = (PLARGE_INTEGER)((PUCHAR)currentProcess + EPROCESS_CREATETIME_OFFSET);
+				processInfo->CreateTime = *createTime;
 
-			// I/O information
-			processInfo->ReadOperationCount = processEntry->IoCounters.ReadOperationCount;
-			processInfo->WriteOperationCount = processEntry->IoCounters.WriteOperationCount;
-			processInfo->OtherOperationCount = processEntry->IoCounters.OtherOperationCount;
-			processInfo->ReadTransferCount = processEntry->IoCounters.ReadTransferCount;
-			processInfo->WriteTransferCount = processEntry->IoCounters.WriteTransferCount;
-			processInfo->OtherTransferCount = processEntry->IoCounters.OtherTransferCount;
+				//PULONG handleCount = (PULONG)((PUCHAR)currentProcess + EPROCESS_HANDLECOUNT_OFFSET);
+				//processInfo->HandleCount = *handleCount;
 
+				// Contar threads
+				PLIST_ENTRY threadListHead = (PLIST_ENTRY)((PUCHAR)currentProcess + EPROCESS_THREADLISTHEAD_OFFSET);
+				PLIST_ENTRY currentEntry = threadListHead->Flink;
+				ULONG threadCount = 0;
+
+				while (currentEntry != threadListHead && threadCount < 1000) {
+					threadCount++;
+					currentEntry = currentEntry->Flink;
+				}
+				processInfo->ThreadCount = threadCount;
+
+				// Informações de memória
+				PMMSUPPORT vmSupport = (PMMSUPPORT)((PUCHAR)currentProcess + EPROCESS_VMS_OFFSET);
+				processInfo->WorkingSetSize = vmSupport->WorkingSetSize * PAGE_SIZE;
+				processInfo->PeakWorkingSetSize = vmSupport->PeakWorkingSetSize * PAGE_SIZE;
+				processInfo->PageFaultCount = vmSupport->PageFaultCount;
+
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				processInfo->CreateTime.QuadPart = 0;
+				processInfo->HandleCount = 0;
+				processInfo->ThreadCount = 0;
+				processInfo->WorkingSetSize = 0;
+				processInfo->PeakWorkingSetSize = 0;
+				processInfo->PageFaultCount = 0;
+			}
+
+			processInfo->CurrentProcessAddress = currentProcess;
 			return STATUS_SUCCESS;
 		}
 
-		if (processEntry->NextEntryDelta == 0) break;
-		processEntry = (PSYSTEM_PROCESSES)((BYTE*)processEntry + processEntry->NextEntryDelta);
-	} while (TRUE);
+		currentProcess = GetNextProcessManual(currentProcess);
+		iterations++;
+
+		// Proteção contra loop infinito
+		if (iterations > 10000) {
+			break;
+		}
+
+	} while (currentProcess && currentProcess != initialProcess);
 
 	return STATUS_NOT_FOUND;
 }
 
-NTSTATUS ListProcesses() {
+NTSTATUS ListProcessesEPROCESS() {
 	NTSTATUS ntstatus = STATUS_SUCCESS;
 
-	UNICODE_STRING uniName = RTL_CONSTANT_STRING(L"\\SystemRoot\\KernelProcessList.txt");
+	UNICODE_STRING uniName = RTL_CONSTANT_STRING(L"\\SystemRoot\\KernelProcessListEPROCESS.txt");
 	OBJECT_ATTRIBUTES objAttr;
 
 	InitializeObjectAttributes(&objAttr, &uniName,
@@ -340,38 +409,45 @@ NTSTATUS ListProcesses() {
 		NULL, 0);
 
 	if (NT_SUCCESS(ntstatus)) {
-		ULONG bufferSize = 0;
+		PEPROCESS currentProcess = PsGetCurrentProcess();
+		PEPROCESS initialProcess = currentProcess;
+		ULONG iterations = 0;
 
-		if (ZwQuerySystemInformation(SystemProcessInformation, NULL, 0, &bufferSize) == STATUS_INFO_LENGTH_MISMATCH) {
-			if (bufferSize) {
-				PVOID memory = ExAllocatePoolWithTag(PagedPool, bufferSize, POOL_TAG);
+		if (currentProcess) {
+			do {
+				HANDLE processId = PsGetProcessId(currentProcess);
+				PUCHAR imageFileName = PsGetProcessImageFileName(currentProcess);
 
-				if (memory) {
-					ntstatus = ZwQuerySystemInformation(SystemProcessInformation, memory, bufferSize, &bufferSize);
+				if (imageFileName) {
+					CHAR string[200];
+					ntstatus = RtlStringCbPrintfA(string, sizeof(string),
+						"PID: %lu, Name: %s, EPROCESS: 0x%p\n",
+						HandleToULong(processId),
+						imageFileName,
+						currentProcess);
+
 					if (NT_SUCCESS(ntstatus)) {
-						PSYSTEM_PROCESSES processEntry = (PSYSTEM_PROCESSES)memory;
+						size_t length;
+						ntstatus = RtlStringCbLengthA(string, sizeof(string), &length);
 
-						do {
-							if (processEntry->ProcessName.Length) {
-								CHAR string[100];
-								ntstatus = RtlStringCbPrintfA(string, _countof(string), "%ws : %llu\n", processEntry->ProcessName.Buffer, processEntry->ProcessId);
-
-								if (NT_SUCCESS(ntstatus)) {
-									size_t length;
-									ntstatus = RtlStringCbLengthA(string, _countof(string), &length);
-
-									if (NT_SUCCESS(ntstatus))
-										ntstatus = ZwWriteFile(file, NULL, NULL, NULL, &ioStatusBlock, string, (ULONG)length, NULL, NULL);
-								}
-							}
-							if (processEntry->NextEntryDelta == 0) break;
-							processEntry = (PSYSTEM_PROCESSES)((BYTE*)processEntry + processEntry->NextEntryDelta);
-						} while (TRUE);
+						if (NT_SUCCESS(ntstatus)) {
+							ntstatus = ZwWriteFile(file, NULL, NULL, NULL, &ioStatusBlock,
+								string, (ULONG)length, NULL, NULL);
+						}
 					}
-					ExFreePoolWithTag(memory, POOL_TAG);
 				}
-			}
+
+				currentProcess = GetNextProcessManual(currentProcess);
+				iterations++;
+
+				// Proteção contra loop infinito
+				if (iterations > 10000) {
+					break;
+				}
+
+			} while (currentProcess && currentProcess != initialProcess);
 		}
+
 		ZwClose(file);
 	}
 
@@ -393,13 +469,13 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
 
 	switch (controlCode) {
 	case codes::IOCTL_LIST_PROCESSES:
-		status = ListProcesses();
+		status = ListProcessesEPROCESS();
 		break;
 
 	case codes::IOCTL_GET_PROCESS_COUNT:
 		if (outputBufferLength >= sizeof(PROCESS_COUNT_RESPONSE)) {
 			PPROCESS_COUNT_RESPONSE response = (PPROCESS_COUNT_RESPONSE)outputBuffer;
-			status = GetProcessCount(&response->ProcessCount);
+			status = GetProcessCountEPROCESS(&response->ProcessCount);
 			response->Status = status;
 			bytesReturned = sizeof(PROCESS_COUNT_RESPONSE);
 		}
@@ -414,7 +490,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
 			PPROCESS_INFO processInfo = (PPROCESS_INFO)outputBuffer;
 
 			if (request->RequestType == 0) { // By index
-				status = GetProcessByIndex(request->Index, processInfo);
+				status = GetProcessByIndexEPROCESS(request->Index, processInfo);
 				if (NT_SUCCESS(status)) {
 					bytesReturned = sizeof(PROCESS_INFO);
 				}
@@ -434,7 +510,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
 			PPROCESS_INFO processInfo = (PPROCESS_INFO)outputBuffer;
 
 			if (request->RequestType == 1) { // By PID
-				status = GetProcessByPid(request->ProcessId, processInfo);
+				status = GetProcessByPidEPROCESS(request->ProcessId, processInfo);
 				if (NT_SUCCESS(status)) {
 					bytesReturned = sizeof(PROCESS_INFO);
 				}
@@ -459,7 +535,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT deviceObject, PIRP irp) {
 struct Request {
 	ULONG RequestId; // Unique request ID
 	ULONG DataLength; // Length of the data
-	UCHAR Data[256]; // Buffer for data	
+	UCHAR Data[256]; // Buffer for data
 };
 
 void DriverUnload(PDRIVER_OBJECT driverObject) {
@@ -469,12 +545,6 @@ void DriverUnload(PDRIVER_OBJECT driverObject) {
 
 	if (driverObject->DeviceObject) {
 		IoDeleteDevice(driverObject->DeviceObject);
-	}
-
-	// Clean up process cache
-	if (g_ProcessBuffer) {
-		ExFreePoolWithTag(g_ProcessBuffer, POOL_TAG);
-		g_ProcessBuffer = NULL;
 	}
 
 	DebugPrint("[+] Driver unloaded successfully\n");

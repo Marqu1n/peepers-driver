@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <string>
 
+
 #define IOCTL_LIST_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_GET_PROCESS_COUNT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_GET_PROCESS_BY_INDEX CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)
@@ -26,7 +27,7 @@ typedef struct _PROCESS_INFO {
 	SIZE_T PeakVirtualSize;
 	SIZE_T PagefileUsage;
 	SIZE_T PeakPagefileUsage;
-	SIZE_T PageFaultCount;  // Changed from PrivatePageCount
+	SIZE_T PageFaultCount;
 
 	// I/O information
 	ULONGLONG ReadOperationCount;
