@@ -199,11 +199,38 @@ O servidor automaticamente envia os resultados das operações para uma API remo
 ### "Failed to open device"
 - Certifique-se de que o driver do kernel está carregado
 - Execute como administrador
-- Verifique se o nome do dispositivo está correto (`\\.\ExampleDriver`)
+- Verifique se o driver do kernel está carregado e assinado corretamente
+- Confirme o nome do dispositivo e o caminho (`\\.\ExampleDriver`)
+- Verifique permissões de acesso ao dispositivo (pode ser necessário ajustar ACLs ou executar como SYSTEM para diagnósticos)
+- Use ferramentas como Device Manager, sc query ou log do driver para confirmar que o driver está ativo
 
 ### "Failed to start server"
-- Verifique se a porta 8888 não está em uso
-- Execute como administrador
+- Verifique se a porta configurada não está em uso (por padrão, verifique PEEPERS_SERVER_PORT ou 8888)
+  - Windows: netstat -ano | findstr :8888
+  - PowerShell: Get-NetTCPConnection -LocalPort 8888
+- Confirme a configuração atual via endpoint /webhook/get-config ou variáveis de ambiente (PEEPERS_SERVER_PORT, PEEPERS_SERVER_HOST)
+- Execute como administrador (necessário para operações que interagem com o driver)
+- Verifique regras de firewall e políticas de rede que possam bloquear a porta ou vinculação ao host
+- Se o servidor estiver configurado para 0.0.0.0, teste também ligação a localhost para isolar problemas de rede
+- Consulte os logs do aplicativo para mensagens detalhadas de erro e stack traces, se disponíveis
+
+### Configuração não carregada
+- Verifique as variáveis de ambiente: echo %PEEPERS_API_URL%
+- Verifique o registro: reg query "HKLM\SOFTWARE\PeepersDriver"
+- Use o endpoint /webhook/get-config para diagnóstico e para ver a origem da configuração (Environment, Registry ou Default)
+- Se salvou via /webhook/save-config, confirme que os valores foram gravados como REG_SZ/REG_DWORD corretos
+
+### Dependências não encontradas
+- Instale cpp-httplib e nlohmann-json via vcpkg ou coloque os headers (httplib.h, json.hpp) no include path
+- Execute vcpkg integrate install se estiver usando vcpkg
+- Verifique as configurações do projeto (.vcxproj) para garantir que o include path aponte para os headers
+
+### Problemas de Permissão
+- Execute o programa como administrador ("Run as administrator")
+- Para operações de registro e instalação do driver, use uma sessão com privilégio administrativo
+- Verifique se o usuário atual tem permissão para modificar chaves em HKLM quando usando gravação no registro
+
+Se os problemas persistirem, colete logs e configuração atual (via /webhook/get-config) e compartilhe-os com o suporte para investigação adicional.
 - Verifique configurações de firewall
 
 ### Dependências não encontradas
