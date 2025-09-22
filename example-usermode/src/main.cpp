@@ -270,24 +270,20 @@ json ProcessInfoToJson(const PROCESS_INFO& info) {
     j["userTime"] = info.UserTime.QuadPart;
     j["kernelTime"] = info.KernelTime.QuadPart;
 
-    j["memory"] = {
-        {"workingSetSize", info.WorkingSetSize},
-        {"peakWorkingSetSize", info.PeakWorkingSetSize},
-        {"virtualSize", info.VirtualSize},
-        {"peakVirtualSize", info.PeakVirtualSize},
-        {"pagefileUsage", info.PagefileUsage},
-        {"peakPagefileUsage", info.PeakPagefileUsage},
-        {"pageFaultCount", info.PageFaultCount}
-    };
+    j["workingSetSize"] = info.WorkingSetSize;
+    j["peakWorkingSetSize"] = info.PeakWorkingSetSize;
+    j["virtualSize"] = info.VirtualSize;
+    j["peakVirtualSize"] = info.PeakVirtualSize;
+    j["pagefileUsage"] = info.PagefileUsage;
+    j["peakPagefileUsage"] = info.PeakPagefileUsage;
+    j["pageFaultCount"] = info.PageFaultCount;
 
-    j["io"] = {
-        {"readOperationCount", info.ReadOperationCount},
-        {"writeOperationCount", info.WriteOperationCount},
-        {"otherOperationCount", info.OtherOperationCount},
-        {"readTransferCount", info.ReadTransferCount},
-        {"writeTransferCount", info.WriteTransferCount},
-        {"otherTransferCount", info.OtherTransferCount}
-    };
+    j["readOperationCount"] = info.ReadOperationCount;
+    j["writeOperationCount"] = info.WriteOperationCount;
+    j["otherOperationCount"] = info.OtherOperationCount;
+    j["readTransferCount"] = info.ReadTransferCount;
+    j["writeTransferCount"] = info.WriteTransferCount;
+    j["otherTransferCount"] = info.OtherTransferCount;
 
     std::stringstream ss;
     ss << "0x" << std::hex << (uintptr_t)info.CurrentProcessAddress;
