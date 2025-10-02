@@ -20,6 +20,12 @@
 #define IOCTL_GET_PROCESS_BY_INDEX CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)
 #define IOCTL_GET_PROCESS_BY_PID CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_DATA)
 
+typedef struct _ADJACENT_PROCESS_INFO {
+    ULONG ProcessId;
+    WCHAR ProcessName[64];
+    PVOID EProcessAddress;
+} ADJACENT_PROCESS_INFO, * PADJACENT_PROCESS_INFO;
+
 typedef struct _PROCESS_INFO {
 	ULONG ProcessId;
 	ULONG ParentProcessId;
@@ -47,8 +53,8 @@ typedef struct _PROCESS_INFO {
 	ULONGLONG OtherTransferCount;
 
 	PVOID CurrentProcessAddress;
-	PVOID NextProcessAddress;
-	PVOID PreviousProcessAddress;
+    ADJACENT_PROCESS_INFO NextProcess;
+    ADJACENT_PROCESS_INFO PreviousProcess;
 } PROCESS_INFO, * PPROCESS_INFO;
 
 typedef struct _PROCESS_REQUEST {
@@ -289,13 +295,23 @@ json ProcessInfoToJson(const PROCESS_INFO& info) {
     ss << "0x" << std::hex << (uintptr_t)info.CurrentProcessAddress;
     j["currentProcessAddress"] = ss.str();
 
-    ss.str("");
-    ss << "0x" << std::hex << (uintptr_t)info.PreviousProcessAddress;
-    j["previousProcessAddress"] = ss.str();
+    j["previousProcess"] = json::object();
 
     ss.str("");
-    ss << "0x" << std::hex << (uintptr_t)info.NextProcessAddress;
-    j["nextProcessAddress"] = ss.str();
+    ss << "0x" << std::hex << (uintptr_t)info.PreviousProcess.EProcessAddress;
+    j["previousProcess"]["eProcessAddress"] = ss.str();
+    j["previousProcess"]["processId"] = info.PreviousProcess.ProcessId;
+    std::wstring prevProcessNameWide(info.PreviousProcess.ProcessName);
+    j["previousProcess"]["processName"] = WideStringToUtf8(prevProcessNameWide);
+
+    j["nextProcess"] = json::object();
+
+    ss.str("");
+    ss << "0x" << std::hex << (uintptr_t)info.NextProcess.EProcessAddress;
+    j["nextProcess"]["eProcessAddress"] = ss.str();
+    j["nextProcess"]["processId"] = info.NextProcess.ProcessId;
+    std::wstring nextProcessNameWide(info.NextProcess.ProcessName);
+    j["nextProcess"]["processName"] = WideStringToUtf8(nextProcessNameWide);
 
     return j;
 }
@@ -518,9 +534,11 @@ void HandleIterateProcesses(const httplib::Request& req, httplib::Response& res)
 
             json processBasic;
             std::wstring processNameWide(processInfo.ProcessName);
-            processBasic["index"] = i;
-            processBasic["processName"] = WideStringToUtf8(processNameWide);
-            processBasic["processId"] = processInfo.ProcessId;
+            //processBasic["index"] = i;
+            //processBasic["processName"] = WideStringToUtf8(processNameWide);
+            //processBasic["processId"] = processInfo.ProcessId;
+            processBasic = ProcessInfoToJson(processInfo);
+            //DisplayProcessInfo(processInfo);
 
             processes.push_back(processBasic);
         }

@@ -29,7 +29,12 @@ NTSTATUS DispatchCreateClose(PDEVICE_OBJECT deviceObject, PIRP Irp) {
 	return STATUS_SUCCESS;
 }
 
-// Enhanced process information structure for usermode communication
+typedef struct _ADJACENT_PROCESS_INFO {
+	ULONG ProcessId;
+	WCHAR ProcessName[64];
+	PVOID EProcessAddress;
+} ADJACENT_PROCESS_INFO, * PADJACENT_PROCESS_INFO;
+
 typedef struct _PROCESS_INFO {
 	ULONG ProcessId;
 	ULONG ParentProcessId;
@@ -59,8 +64,10 @@ typedef struct _PROCESS_INFO {
 	ULONGLONG OtherTransferCount;
 
 	PVOID CurrentProcessAddress;
-	PVOID NextProcessAddress;
-	PVOID PreviousProcessAddress;
+	ADJACENT_PROCESS_INFO NextProcess;
+	ADJACENT_PROCESS_INFO PreviousProcess;
+	//PVOID NextProcessAddress;
+	//PVOID PreviousProcessAddress;
 } PROCESS_INFO, * PPROCESS_INFO;
 
 // Request structures for usermode communication
@@ -94,30 +101,86 @@ extern "C" NTKERNELAPI ULONG PsGetProcessSessionId(PEPROCESS Process);
 #define EPROCESS_RUNDOWNPROTECT_OFFSET 0x1e8      // RundownProtect
 #define EPROCESS_VMS_OFFSET 0x400                 // Vm (Virtual Memory Stats)
 
-// Estrutura para estatísticas de memória virtual
-typedef struct _MMSUPPORT_FLAGS {
-	UCHAR WorkingSetType : 3;
-	UCHAR Reserved0 : 3;
-	UCHAR MaximumWorkingSetHard : 1;
-	UCHAR MinimumWorkingSetHard : 1;
-	UCHAR SessionMaster : 1;
-	UCHAR TrimmerState : 2;
-	UCHAR Reserved : 1;
-	UCHAR PageStealers : 4;
-} MMSUPPORT_FLAGS;
+typedef struct _MMSUPPORT_FLAGS
+{
+	union
+	{
+		struct
+		{
+			UCHAR WorkingSetType : 4;                                         //0x0
+			UCHAR Reserved0 : 2;                                              //0x0
+			UCHAR MaximumWorkingSetHard : 1;                                  //0x0
+			UCHAR MinimumWorkingSetHard : 1;                                  //0x0
+			UCHAR Reserved1 : 1;                                              //0x1
+			UCHAR TrimmerState : 2;                                           //0x1
+			UCHAR LinearAddressProtected : 1;                                 //0x1
+			UCHAR PageStealers : 4;                                           //0x1
+		};
+		struct
+		{
+			USHORT u1;                                                      //0x0
+			UCHAR MemoryPriority;                                           //0x2
+			union
+			{
+				struct
+				{
+					UCHAR WsleDeleted : 1;                                    //0x3
+					UCHAR SvmEnabled : 1;                                     //0x3
+					UCHAR ForceAge : 1;                                       //0x3
+					UCHAR ForceTrim : 1;                                      //0x3
+					UCHAR CommitReleaseState : 2;                             //0x3
+					UCHAR Reserved2 : 2;                                      //0x3
+				};
+				UCHAR u2;                                                   //0x3
+			};
+		};
+		ULONG EntireFlags;                                                  //0x0
+	};
+};
 
-typedef struct _MMSUPPORT {
-	LIST_ENTRY WorkingSetExpansionLinks;
-	USHORT LastTrimStamp;
-	USHORT NextPageColor;
-	MMSUPPORT_FLAGS Flags;
-	ULONG PageFaultCount;
-	ULONG PeakWorkingSetSize;
-	ULONG WorkingSetSize;
-	ULONG MinimumWorkingSetSize;
-	ULONG MaximumWorkingSetSize;
-	// ... outros campos
-} MMSUPPORT, * PMMSUPPORT;
+typedef struct _MMSUPPORT_INSTANCE
+{
+	ULONG NextPageColor;                                                    //0x0
+	volatile ULONG PageFaultCount;                                          //0x4
+	ULONGLONG TrimmedPageCount;                                             //0x8
+	struct _MMWSL_INSTANCE* VmWorkingSetList;                               //0x10
+	struct _LIST_ENTRY WorkingSetExpansionLinks;                            //0x18
+	volatile ULONGLONG AgeDistribution[8];                                  //0x28
+	struct _KGATE* ExitOutswapGate;                                         //0x68
+	ULONGLONG MinimumWorkingSetSize;                                        //0x70
+	ULONGLONG MaximumWorkingSetSize;                                        //0x78
+	volatile ULONGLONG WorkingSetLeafSize;                                  //0x80
+	volatile ULONGLONG WorkingSetLeafPrivateSize;                           //0x88
+	volatile ULONGLONG WorkingSetSize;                                      //0x90
+	volatile ULONGLONG WorkingSetPrivateSize;                               //0x98
+	volatile ULONGLONG PeakWorkingSetSize;                                  //0xa0
+	ULONG HardFaultCount;                                                   //0xa8
+	USHORT LastTrimStamp;                                                   //0xac
+	USHORT PartitionId;                                                     //0xae
+	ULONGLONG SelfmapLock;                                                  //0xb0
+	volatile struct _MMSUPPORT_FLAGS Flags;                                 //0xb8
+	volatile ULONG InterlockedFlags;                                        //0xbc
+} MMSUPPORT_INSTANCE, *PMMSUPPORT_INSTANCE;
+
+struct _MMSUPPORT_SHARED
+{
+	VOID* WorkingSetLockArray;                                              //0x0
+	ULONGLONG ReleasedCommitDebt;                                           //0x8
+	ULONGLONG ResetPagesRepurposedCount;                                    //0x10
+	VOID* WsSwapSupport;                                                    //0x18
+	VOID* CommitReleaseContext;                                             //0x20
+	VOID* AccessLog;                                                        //0x28
+	volatile ULONGLONG ChargedWslePages;                                    //0x30
+	volatile ULONGLONG ActualWslePages;                                     //0x38
+	volatile LONG WorkingSetCoreLock;                                       //0x40
+	VOID* ShadowMapping;                                                    //0x48
+};
+
+typedef struct _MMSUPPORT_FULL
+{
+	struct _MMSUPPORT_INSTANCE Instance;                                    //0x0
+	struct _MMSUPPORT_SHARED Shared;                                        //0xc0
+} MMSUPPORT, *PMMSUPPORT;
 
 // Global variables to cache process information
 static ULONG g_ProcessCount = 0;
@@ -202,6 +265,11 @@ NTSTATUS GetProcessByIndexEPROCESS(ULONG index, PPROCESS_INFO processInfo) {
 
 	// Percorrer até o índice desejado
 	while (currentIndex < index) {
+		processInfo->PreviousProcess.ProcessId = processInfo->ProcessId;
+		RtlCopyMemory(processInfo->PreviousProcess.ProcessName,
+			processInfo->ProcessName,
+			sizeof(processInfo->ProcessName));
+		processInfo->PreviousProcess.EProcessAddress = currentProcess;
 		previousProcess = currentProcess;
 		currentProcess = GetNextProcessManual(currentProcess);
 
@@ -271,9 +339,9 @@ NTSTATUS GetProcessByIndexEPROCESS(ULONG index, PPROCESS_INFO processInfo) {
 
 		// Informações de memória virtual (usando offset para MMSUPPORT)
 		PMMSUPPORT vmSupport = (PMMSUPPORT)((PUCHAR)currentProcess + EPROCESS_VMS_OFFSET);
-		processInfo->WorkingSetSize = vmSupport->WorkingSetSize * PAGE_SIZE;
-		processInfo->PeakWorkingSetSize = vmSupport->PeakWorkingSetSize * PAGE_SIZE;
-		processInfo->PageFaultCount = vmSupport->PageFaultCount;
+		processInfo->WorkingSetSize = vmSupport->Instance.WorkingSetSize * PAGE_SIZE;
+		processInfo->PeakWorkingSetSize = vmSupport->Instance.PeakWorkingSetSize * PAGE_SIZE;
+		processInfo->PageFaultCount = vmSupport->Instance.PageFaultCount;
 
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -288,15 +356,31 @@ NTSTATUS GetProcessByIndexEPROCESS(ULONG index, PPROCESS_INFO processInfo) {
 
 	// Endereços dos processos
 	processInfo->CurrentProcessAddress = currentProcess;
-	processInfo->PreviousProcessAddress = previousProcess;
 
 	PEPROCESS nextProcess = GetNextProcessManual(currentProcess);
-	processInfo->NextProcessAddress = (nextProcess != initialProcess) ? nextProcess : NULL;
+	if (nextProcess != initialProcess)
+	{
+		processInfo->NextProcess.ProcessId = HandleToULong(PsGetProcessId(nextProcess));
+		PUCHAR imageFileNameNextProcess = PsGetProcessImageFileName(nextProcess);
+		if (imageFileNameNextProcess) {
+			ANSI_STRING ansiString;
+			UNICODE_STRING unicodeString;
+			RtlInitAnsiString(&ansiString, (PCSZ)imageFileNameNextProcess);
+
+			unicodeString.Buffer = processInfo->NextProcess.ProcessName;
+			unicodeString.MaximumLength = sizeof(processInfo->NextProcess.ProcessName);
+			unicodeString.Length = 0;
+
+			RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
+		}
+		processInfo->NextProcess.EProcessAddress = nextProcess;
+	}
 
 	return STATUS_SUCCESS;
 }
 
 NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
+	PEPROCESS previousProcess = NULL;
 	PEPROCESS currentProcess = NULL;
 	PEPROCESS initialProcess = NULL;
 	ULONG iterations = 0;
@@ -312,10 +396,28 @@ NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
 	// Percorrer a lista procurando pelo PID
 	do {
 		HANDLE currentPid = PsGetProcessId(currentProcess);
+		PEPROCESS nextProcess = GetNextProcessManual(currentProcess);
 
 		if (HandleToULong(currentPid) == processId) {
 			// Processo encontrado, preencher informações
 			RtlZeroMemory(processInfo, sizeof(PROCESS_INFO));
+
+			if (previousProcess != NULL) {
+				processInfo->PreviousProcess.ProcessId = HandleToULong(PsGetProcessId(previousProcess));
+				PUCHAR previousProcessImageFileName = PsGetProcessImageFileName(previousProcess);
+				if (previousProcessImageFileName) {
+					ANSI_STRING ansiString;
+					UNICODE_STRING unicodeString;
+					RtlInitAnsiString(&ansiString, (PCSZ)previousProcessImageFileName);
+
+					unicodeString.Buffer = processInfo->PreviousProcess.ProcessName;
+					unicodeString.MaximumLength = sizeof(processInfo->PreviousProcess.ProcessName);
+					unicodeString.Length = 0;
+
+					RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
+				}
+				processInfo->PreviousProcess.EProcessAddress = previousProcess;
+			}
 
 			processInfo->ProcessId = processId;
 			processInfo->ParentProcessId = HandleToULong(PsGetProcessInheritedFromUniqueProcessId(currentProcess));
@@ -355,9 +457,9 @@ NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
 
 				// Informações de memória
 				PMMSUPPORT vmSupport = (PMMSUPPORT)((PUCHAR)currentProcess + EPROCESS_VMS_OFFSET);
-				processInfo->WorkingSetSize = vmSupport->WorkingSetSize * PAGE_SIZE;
-				processInfo->PeakWorkingSetSize = vmSupport->PeakWorkingSetSize * PAGE_SIZE;
-				processInfo->PageFaultCount = vmSupport->PageFaultCount;
+				processInfo->WorkingSetSize = vmSupport->Instance.WorkingSetSize * PAGE_SIZE;
+				processInfo->PeakWorkingSetSize = vmSupport->Instance.PeakWorkingSetSize * PAGE_SIZE;
+				processInfo->PageFaultCount = vmSupport->Instance.PageFaultCount;
 
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -370,10 +472,25 @@ NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
 			}
 
 			processInfo->CurrentProcessAddress = currentProcess;
+			processInfo->NextProcess.ProcessId = HandleToULong(PsGetProcessId(nextProcess));
+			PUCHAR imageFileNameNextProcess = PsGetProcessImageFileName(nextProcess);
+			if (imageFileNameNextProcess) {
+				ANSI_STRING ansiString;
+				UNICODE_STRING unicodeString;
+				RtlInitAnsiString(&ansiString, (PCSZ)imageFileNameNextProcess);
+
+				unicodeString.Buffer = processInfo->NextProcess.ProcessName;
+				unicodeString.MaximumLength = sizeof(processInfo->NextProcess.ProcessName);
+				unicodeString.Length = 0;
+
+				RtlAnsiStringToUnicodeString(&unicodeString, &ansiString, FALSE);
+			}
+			processInfo->NextProcess.EProcessAddress = nextProcess;
 			return STATUS_SUCCESS;
 		}
 
-		currentProcess = GetNextProcessManual(currentProcess);
+		previousProcess = currentProcess;
+		currentProcess = nextProcess;
 		iterations++;
 
 		// Proteção contra loop infinito
