@@ -41,7 +41,7 @@ typedef struct _PROCESS_INFO {
 	WCHAR ProcessName[64];
 	ULONG ThreadCount;
 	ULONG HandleCount;
-	LONG BasePriority;
+	UCHAR BasePriority;
 	LARGE_INTEGER CreateTime;
 	LARGE_INTEGER UserTime;
 	LARGE_INTEGER KernelTime;
@@ -454,6 +454,11 @@ NTSTATUS GetProcessByPidEPROCESS(ULONG processId, PPROCESS_INFO processInfo) {
 					currentEntry = currentEntry->Flink;
 				}
 				processInfo->ThreadCount = threadCount;
+
+				processInfo->VirtualSize = *((PULONGLONG)((PUCHAR)currentProcess + 0x228));
+				processInfo->PeakVirtualSize = *((PULONGLONG)((PUCHAR)currentProcess + 0x220));
+
+				processInfo->BasePriority = *((PUCHAR)((PUCHAR)currentProcess + 0x347));
 
 				// Informações de memória
 				PMMSUPPORT vmSupport = (PMMSUPPORT)((PUCHAR)currentProcess + EPROCESS_VMS_OFFSET);

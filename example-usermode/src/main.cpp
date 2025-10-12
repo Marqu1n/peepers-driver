@@ -32,7 +32,7 @@ typedef struct _PROCESS_INFO {
 	WCHAR ProcessName[64];
 	ULONG ThreadCount;
 	ULONG HandleCount;
-	LONG BasePriority;
+	UCHAR BasePriority;
 	LARGE_INTEGER CreateTime;
 	LARGE_INTEGER UserTime;
 	LARGE_INTEGER KernelTime;
