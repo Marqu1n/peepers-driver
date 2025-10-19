@@ -1,2 +1,2 @@
 # peepers-driver
-A "spyware" made for educational purposes
+A Windows driver that list the EPROCESS linked list.
